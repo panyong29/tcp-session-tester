@@ -1,14 +1,10 @@
-"""TCP 会话数测试 - 客户端 v1.0
+"""TCP连接数探测工具 V1.0（NBR 风格）
 
-填服务器地址、端口、并发数等参数，一键测试目标 TCP 服务能扛住多少并发会话。
-两种模式：
-  建连保持：连上 N 个会话并保持一段时间（测会话表/连接数上限）
-  建连+回显：每个连接发一包数据、收回显后关闭（测建连+收发能力）
-
-网络 IO 跑在后台线程的 asyncio 事件循环里，界面不卡。
+多线程持续建连并保持，探测目标的最大 TCP 并发连接数。
+失败数达到阈值或达到探测上限时自动停止。
 """
-import asyncio
 import queue
+import socket
 import threading
 import time
 import tkinter as tk
@@ -17,203 +13,165 @@ from tkinter import messagebox, ttk
 APP_VERSION = "1.0"
 
 
-# ---------------- 后台测试逻辑（跑在工作线程） ----------------
+class Prober:
+    """探测器：多线程建连并保持，失败达阈值或达上限时停止。"""
 
-async def _one_conn(params, shared, release_evt):
-    """单个连接：建连 -> 按模式收发/保持 -> 关闭"""
-    t0 = time.monotonic()
-    try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(params["host"], params["port"]),
-            timeout=params["timeout"])
-    except Exception:
-        shared["failed"] += 1
-        return
-    shared["ok"] += 1
-    shared["lat_sum"] += time.monotonic() - t0
-    shared["active"] += 1
-    try:
-        if params["mode"] == "echo":
-            payload = b"x" * params["payload"]
-            writer.write(payload)
-            await writer.drain()
-            got = 0
-            while got < len(payload):
-                chunk = await asyncio.wait_for(reader.read(65536), timeout=params["timeout"])
-                if not chunk:
-                    break
-                got += len(chunk)
-            if got >= len(payload):
-                shared["echo_ok"] += 1
-            else:
-                shared["echo_fail"] += 1
-        else:  # hold：保持到主控释放
-            await release_evt.wait()
-    except Exception:
-        shared["failed"] += 1
-    finally:
-        shared["active"] -= 1
+    def __init__(self, host, port, interval_ms, thread_count, max_probe, max_fail, ui_q):
+        self.host = host
+        self.port = port
+        self.interval = interval_ms / 1000.0
+        self.thread_count = thread_count
+        self.max_probe = max_probe
+        self.max_fail = max_fail
+        self.ui_q = ui_q
+        self.lock = threading.Lock()
+        self.sockets = []  # 保持住的连接
+        self.attempted = 0
+        self.success = 0
+        self.failed = 0
+        self.stop_flag = threading.Event()
+        self.threads = []
+
+    def _report(self):
         try:
-            writer.close()
-        except Exception:
+            self.ui_q.put_nowait({
+                "success": self.success, "failed": self.failed,
+                "attempted": self.attempted, "active": len(self.sockets),
+            })
+        except queue.Full:
             pass
 
+    def _worker(self):
+        while not self.stop_flag.is_set():
+            with self.lock:
+                if self.attempted >= self.max_probe or self.failed >= self.max_fail:
+                    self.stop_flag.set()
+                    break
+                self.attempted += 1
+            try:
+                s = socket.create_connection((self.host, self.port), timeout=10)
+            except Exception:  # noqa: BLE001
+                with self.lock:
+                    self.failed += 1
+                self._report()
+            else:
+                with self.lock:
+                    self.sockets.append(s)
+                    self.success += 1
+                self._report()
+            if self.interval > 0:
+                self.stop_flag.wait(self.interval)  # 可中断的间隔
 
-def _snapshot(params, shared, phase):
-    avg_ms = (shared["lat_sum"] / shared["ok"] * 1000) if shared["ok"] else 0
-    return {
-        "phase": phase,
-        "attempted": shared["attempted"],
-        "ok": shared["ok"],
-        "failed": shared["failed"],
-        "active": shared["active"],
-        "avg_ms": round(avg_ms, 1),
-        "echo_ok": shared["echo_ok"],
-        "echo_fail": shared["echo_fail"],
-        "target": params["concurrency"],
-    }
+    def run(self):
+        self.threads = [threading.Thread(target=self._worker, daemon=True)
+                        for _ in range(self.thread_count)]
+        for t in self.threads:
+            t.start()
+        for t in self.threads:
+            t.join()
+        for s in self.sockets:
+            try:
+                s.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self.sockets.clear()
+        self.ui_q.put({"done": True, "success": self.success,
+                       "failed": self.failed, "attempted": self.attempted})
 
+    def stop(self):
+        self.stop_flag.set()
 
-async def _run(params, ui_q, stop_flag):
-    shared = {"attempted": 0, "ok": 0, "failed": 0, "active": 0,
-              "lat_sum": 0.0, "echo_ok": 0, "echo_fail": 0}
-    release_evt = asyncio.Event()
-    tasks = []
-    try:
-        # 建连阶段：按速率爬坡
-        n = params["concurrency"]
-        interval = 1.0 / params["rate"] if params["rate"] > 0 else 0
-        for _ in range(n):
-            if stop_flag.is_set():
-                break
-            shared["attempted"] += 1
-            tasks.append(asyncio.create_task(_one_conn(params, shared, release_evt)))
-            if interval:
-                await asyncio.sleep(interval)
-        # 等建连结果落定
-        while not stop_flag.is_set():
-            if shared["ok"] + shared["failed"] >= shared["attempted"] \
-                    and shared["attempted"] >= n:
-                break
-            ui_q.put(_snapshot(params, shared, "connecting"))
-            await asyncio.sleep(0.2)
-        # 保持阶段（仅 hold 模式）
-        if params["mode"] == "hold" and not stop_flag.is_set():
-            deadline = time.monotonic() + params["duration"]
-            while time.monotonic() < deadline and not stop_flag.is_set():
-                ui_q.put(_snapshot(params, shared, "holding"))
-                await asyncio.sleep(0.2)
-        release_evt.set()  # 释放保持中的连接
-        if tasks:
-            await asyncio.wait(tasks, timeout=params["timeout"] + 5)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        for t in tasks:
-            if not t.done():
-                t.cancel()
-        ui_q.put(_snapshot(params, shared, "done"))
-
-
-def worker_main(params, ui_q, stop_flag):
-    try:
-        asyncio.run(_run(params, ui_q, stop_flag))
-    except Exception as e:  # noqa: BLE001
-        ui_q.put({"phase": "error", "msg": str(e)})
-
-
-# ---------------- 界面 ----------------
 
 class App:
     def __init__(self, root):
         self.root = root
-        root.title(f"TCP 会话数测试 v{APP_VERSION}")
-        root.geometry("560x520")
+        root.title("TCP连接数探测工具 V1.0")
+        root.geometry("620x600")
         root.resizable(False, False)
 
-        self.ui_q = queue.Queue()
-        self.stop_flag = threading.Event()
-        self.worker = None
-        self.testing = False
+        self.ui_q = queue.Queue(maxsize=100)
+        self.prober = None
+        self.probing = False
         self.t_start = 0
 
         frm = ttk.Frame(root, padding=10)
         frm.pack(fill="both", expand=True)
 
-        # 服务器参数
-        ttk.Label(frm, text="服务器地址").grid(row=0, column=0, sticky="w", pady=3)
-        self.e_host = ttk.Entry(frm, width=24)
-        self.e_host.grid(row=0, column=1, sticky="w", pady=3)
-        ttk.Label(frm, text="端口").grid(row=0, column=2, sticky="w", padx=(10, 0), pady=3)
-        self.e_port = ttk.Entry(frm, width=8)
+        r = 0
+        ttk.Label(frm, text="服务器地址:").grid(row=r, column=0, sticky="w", pady=4)
+        self.e_host = ttk.Entry(frm, width=22)
+        self.e_host.grid(row=r, column=1, sticky="w", pady=4)
+        ttk.Label(frm, text="端口:").grid(row=r, column=2, sticky="w", padx=(12, 0), pady=4)
+        self.e_port = ttk.Entry(frm, width=10)
         self.e_port.insert(0, "9000")
-        self.e_port.grid(row=0, column=3, sticky="w", pady=3)
+        self.e_port.grid(row=r, column=3, sticky="w", pady=4)
 
-        ttk.Label(frm, text="并发连接数").grid(row=1, column=0, sticky="w", pady=3)
-        self.e_conn = ttk.Entry(frm, width=12)
-        self.e_conn.insert(0, "1000")
-        self.e_conn.grid(row=1, column=1, sticky="w", pady=3)
-        ttk.Label(frm, text="建连速率(个/秒,0不限)").grid(row=1, column=2, sticky="w",
-                                                          padx=(10, 0), pady=3)
-        self.e_rate = ttk.Entry(frm, width=8)
-        self.e_rate.insert(0, "200")
-        self.e_rate.grid(row=1, column=3, sticky="w", pady=3)
+        r += 1
+        ttk.Label(frm, text="时间间隔(ms):").grid(row=r, column=0, sticky="w", pady=4)
+        self.e_interval = ttk.Entry(frm, width=22)
+        self.e_interval.insert(0, "100")
+        self.e_interval.grid(row=r, column=1, sticky="w", pady=4)
 
-        ttk.Label(frm, text="测试模式").grid(row=2, column=0, sticky="w", pady=3)
-        self.mode = tk.StringVar(value="hold")
-        mfrm = ttk.Frame(frm)
-        mfrm.grid(row=2, column=1, columnspan=3, sticky="w", pady=3)
-        ttk.Radiobutton(mfrm, text="建连保持", variable=self.mode, value="hold").pack(side="left")
-        ttk.Radiobutton(mfrm, text="建连+回显+关闭", variable=self.mode,
-                        value="echo").pack(side="left", padx=(12, 0))
+        r += 1
+        ttk.Label(frm, text="线程数:").grid(row=r, column=0, sticky="w", pady=4)
+        self.e_threads = ttk.Entry(frm, width=22)
+        self.e_threads.insert(0, "10")
+        self.e_threads.grid(row=r, column=1, sticky="w", pady=4)
 
-        ttk.Label(frm, text="保持时长(秒)").grid(row=3, column=0, sticky="w", pady=3)
-        self.e_dur = ttk.Entry(frm, width=12)
-        self.e_dur.insert(0, "30")
-        self.e_dur.grid(row=3, column=1, sticky="w", pady=3)
-        ttk.Label(frm, text="回显数据(字节)").grid(row=3, column=2, sticky="w",
-                                                    padx=(10, 0), pady=3)
-        self.e_payload = ttk.Entry(frm, width=8)
-        self.e_payload.insert(0, "1024")
-        self.e_payload.grid(row=3, column=3, sticky="w", pady=3)
+        r += 1
+        ttk.Label(frm, text="探测上限:").grid(row=r, column=0, sticky="w", pady=4)
+        self.e_max = ttk.Entry(frm, width=22)
+        self.e_max.insert(0, "10000")
+        self.e_max.grid(row=r, column=1, sticky="w", pady=4)
 
-        ttk.Label(frm, text="连接超时(秒)").grid(row=4, column=0, sticky="w", pady=3)
-        self.e_timeout = ttk.Entry(frm, width=12)
-        self.e_timeout.insert(0, "10")
-        self.e_timeout.grid(row=4, column=1, sticky="w", pady=3)
+        r += 1
+        ttk.Label(frm, text="失败多少次停止探测:").grid(row=r, column=0, sticky="w", pady=4)
+        self.e_maxfail = ttk.Entry(frm, width=22)
+        self.e_maxfail.insert(0, "100")
+        self.e_maxfail.grid(row=r, column=1, sticky="w", pady=4)
 
-        # 按钮
+        r += 1
         bfrm = ttk.Frame(frm)
-        bfrm.grid(row=5, column=0, columnspan=4, pady=10)
-        self.b_start = ttk.Button(bfrm, text="开始测试", command=self.start, width=14)
-        self.b_start.pack(side="left", padx=5)
-        self.b_stop = ttk.Button(bfrm, text="停止", command=self.stop, width=14,
+        bfrm.grid(row=r, column=0, columnspan=4, pady=8, sticky="w")
+        self.b_start = ttk.Button(bfrm, text="开始探测", command=self.start, width=12)
+        self.b_start.pack(side="left", padx=(0, 40))
+        self.b_stop = ttk.Button(bfrm, text="停止探测", command=self.stop, width=12,
                                  state="disabled")
-        self.b_stop.pack(side="left", padx=5)
+        self.b_stop.pack(side="left")
 
-        # 进度 + 统计
-        self.prog = ttk.Progressbar(frm, mode="determinate", length=520)
-        self.prog.grid(row=6, column=0, columnspan=4, pady=4)
-        self.stat_var = tk.StringVar(value="就绪")
-        ttk.Label(frm, textvariable=self.stat_var, font=("", 10)).grid(
-            row=7, column=0, columnspan=4, sticky="w", pady=2)
-        self.stat2_var = tk.StringVar(value="")
-        ttk.Label(frm, textvariable=self.stat2_var, font=("", 10)).grid(
-            row=8, column=0, columnspan=4, sticky="w", pady=2)
+        r += 1
+        ttk.Label(frm, text="参数解析结果:").grid(row=r, column=0, sticky="w", pady=(4, 2))
+        r += 1
+        self.t_param = tk.Text(frm, height=4, width=72, state="disabled")
+        self.t_param.grid(row=r, column=0, columnspan=4, pady=2)
 
-        # 日志
-        ttk.Label(frm, text="日志").grid(row=9, column=0, sticky="w", pady=(6, 2))
-        self.log = tk.Text(frm, height=10, width=66, state="disabled")
-        self.log.grid(row=10, column=0, columnspan=4, pady=2)
+        r += 1
+        ttk.Label(frm, text="探测结果:").grid(row=r, column=0, sticky="w", pady=(6, 2))
+        r += 1
+        sfrm = ttk.Frame(frm)
+        sfrm.grid(row=r, column=0, columnspan=4, sticky="w", pady=2)
+        self.l_ok = ttk.Label(sfrm, text="成功连接数: 0", font=("", 10))
+        self.l_ok.pack(side="left", padx=(0, 60))
+        self.l_fail = ttk.Label(sfrm, text="失败连接数: 0", font=("", 10))
+        self.l_fail.pack(side="left")
+        r += 1
+        self.t_log = tk.Text(frm, height=10, width=72, state="disabled")
+        self.t_log.grid(row=r, column=0, columnspan=4, pady=2)
 
         self._poll()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _log(self, msg):
-        self.log.config(state="normal")
-        self.log.insert("end", f"[{time.strftime('%H:%M:%S')}] {msg}\n")
-        self.log.see("end")
-        self.log.config(state="disabled")
+        self.t_log.config(state="normal")
+        self.t_log.insert("end", f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+        self.t_log.see("end")
+        self.t_log.config(state="disabled")
+
+    def _set_param_text(self, text):
+        self.t_param.config(state="normal")
+        self.t_param.delete("1.0", "end")
+        self.t_param.insert("end", text)
+        self.t_param.config(state="disabled")
 
     def _int(self, entry, name, lo, hi):
         try:
@@ -225,83 +183,64 @@ class App:
         return v
 
     def start(self):
+        if self.probing:
+            return
         host = self.e_host.get().strip()
         if not host:
             messagebox.showwarning("提示", "请填写服务器地址")
             return
         try:
-            params = {
-                "host": host,
-                "port": self._int(self.e_port, "端口", 1, 65535),
-                "concurrency": self._int(self.e_conn, "并发连接数", 1, 50000),
-                "rate": self._int(self.e_rate, "建连速率", 0, 100000),
-                "mode": self.mode.get(),
-                "duration": self._int(self.e_dur, "保持时长", 1, 86400),
-                "payload": self._int(self.e_payload, "回显数据", 1, 1048576),
-                "timeout": self._int(self.e_timeout, "连接超时", 1, 120),
-            }
+            port = self._int(self.e_port, "端口", 1, 65535)
+            interval = self._int(self.e_interval, "时间间隔", 0, 60000)
+            threads = self._int(self.e_threads, "线程数", 1, 200)
+            max_probe = self._int(self.e_max, "探测上限", 1, 1000000)
+            max_fail = self._int(self.e_maxfail, "失败次数", 1, 1000000)
         except ValueError as e:
             messagebox.showwarning("提示", str(e))
             return
-        self.stop_flag.clear()
-        self.testing = True
+        self._set_param_text(
+            f"目标: {host}:{port}\n"
+            f"时间间隔: {interval}ms, 线程数: {threads}, "
+            f"探测上限: {max_probe}, 失败{max_fail}次停止")
+        self._log(f"开始探测 {host}:{port}")
+        self.probing = True
         self.t_start = time.time()
         self.b_start.config(state="disabled")
         self.b_stop.config(state="normal")
-        self.prog["value"] = 0
-        mode_name = "建连保持" if params["mode"] == "hold" else "建连+回显"
-        self._log(f"开始测试 {params['host']}:{params['port']}，模式={mode_name}，"
-                  f"并发={params['concurrency']}")
-        self.worker = threading.Thread(target=worker_main,
-                                       args=(params, self.ui_q, self.stop_flag),
-                                       daemon=True)
-        self.worker.start()
+        self.l_ok.config(text="成功连接数: 0")
+        self.l_fail.config(text="失败连接数: 0")
+        self.prober = Prober(host, port, interval, threads, max_probe, max_fail, self.ui_q)
+        threading.Thread(target=self.prober.run, daemon=True).start()
 
     def stop(self):
-        if self.testing:
+        if self.probing and self.prober:
             self._log("正在停止…")
-            self.stop_flag.set()
+            self.prober.stop()
             self.b_stop.config(state="disabled")
 
     def _poll(self):
         try:
             while True:
-                s = self.ui_q.get_nowait()
-                self._on_stat(s)
+                m = self.ui_q.get_nowait()
+                if m.get("done"):
+                    el = round(time.time() - self.t_start, 1)
+                    self._log(f"探测结束，用时{el}s：成功 {m['success']}，"
+                              f"失败 {m['failed']}，共尝试 {m['attempted']}")
+                    self._log(f"结论：目标最大并发连接数约 {m['success']}")
+                    self.probing = False
+                    self.prober = None
+                    self.b_start.config(state="normal")
+                    self.b_stop.config(state="disabled")
+                else:
+                    self.l_ok.config(text=f"成功连接数: {m['success']}")
+                    self.l_fail.config(text=f"失败连接数: {m['failed']}")
         except queue.Empty:
             pass
         self.root.after(200, self._poll)
 
-    def _on_stat(self, s):
-        phase = s.get("phase")
-        if phase == "error":
-            self._log(f"测试出错: {s.get('msg')}")
-            self._finish()
-            return
-        if phase == "done":
-            el = round(time.time() - self.t_start, 1)
-            self._log(f"测试结束，用时 {el}s：成功 {s['ok']}/{s['target']}，"
-                      f"失败 {s['failed']}，平均建连 {s['avg_ms']}ms")
-            if s["echo_ok"] or s["echo_fail"]:
-                self._log(f"回显：成功 {s['echo_ok']}，失败 {s['echo_fail']}")
-            self._finish()
-            return
-        ph = {"connecting": "建连中", "holding": "保持中"}.get(phase, "")
-        self.stat_var.set(
-            f"{ph}  已尝试 {s['attempted']}/{s['target']}  "
-            f"成功 {s['ok']}  失败 {s['failed']}  当前活跃 {s['active']}")
-        self.stat2_var.set(f"平均建连耗时 {s['avg_ms']}ms")
-        if s["target"]:
-            self.prog["value"] = min(100, s["attempted"] / s["target"] * 100)
-
-    def _finish(self):
-        self.testing = False
-        self.b_start.config(state="normal")
-        self.b_stop.config(state="disabled")
-        self.prog["value"] = 100 if self.prog["value"] else 0
-
     def on_close(self):
-        self.stop_flag.set()
+        if self.prober:
+            self.prober.stop()
         self.root.destroy()
 
 
