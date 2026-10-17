@@ -2,6 +2,8 @@
 
 测目标 TCP 服务能扛住多少并发会话。服务端跑在 Docker 里，客户端是 Windows 图形小工具，填上服务器地址、端口、并发数就能测。
 
+![客户端界面](docs/screenshot.png)
+
 ## 服务端（Docker）
 
 镜像已发布到 ghcr.io，一行命令启动：
