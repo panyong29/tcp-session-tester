@@ -10,15 +10,26 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-APP_VERSION = "1.1"
+APP_VERSION = "2.0"
+
+# 预设测试目标：(显示名, host, port)
+PRESETS = [
+    ("自定义", "", 0),
+    ("阿里DNS", "223.6.6.6", 53),
+    ("Google DNS", "8.8.8.8", 53),
+    ("Cloudflare DNS", "1.1.1.1", 53),
+    ("百度", "www.baidu.com", 80),
+    ("我的服务器", "173.254.227.219", 9000),
+]
 
 
 class Prober:
     """探测器：多线程建连并保持，失败达阈值或达上限时停止。"""
 
-    def __init__(self, host, port, interval_ms, thread_count, max_probe, max_fail, ui_q):
+    def __init__(self, host, port, interval_ms, thread_count, max_probe, max_fail, timeout, ui_q):
         self.host = host
         self.port = port
+        self.timeout = timeout
         self.interval = interval_ms / 1000.0
         self.thread_count = thread_count
         self.max_probe = max_probe
@@ -49,7 +60,7 @@ class Prober:
                     break
                 self.attempted += 1
             try:
-                s = socket.create_connection((self.host, self.port), timeout=10)
+                s = socket.create_connection((self.host, self.port), timeout=self.timeout)
             except Exception:  # noqa: BLE001
                 with self.lock:
                     self.failed += 1
@@ -85,7 +96,7 @@ class Prober:
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("TCP连接数探测工具 V1.1")
+        root.title(f"TCP连接数探测工具 V{APP_VERSION}")
         root.geometry("620x600")
         root.resizable(False, False)
 
@@ -98,6 +109,14 @@ class App:
         frm.pack(fill="both", expand=True)
 
         r = 0
+        ttk.Label(frm, text="预设目标:").grid(row=r, column=0, sticky="w", pady=4)
+        self.preset_var = tk.StringVar(value=PRESETS[0][0])
+        self.cb_preset = ttk.Combobox(frm, textvariable=self.preset_var, width=20,
+                                      values=[p[0] for p in PRESETS], state="readonly")
+        self.cb_preset.grid(row=r, column=1, sticky="w", pady=4)
+        self.cb_preset.bind("<<ComboboxSelected>>", self._on_preset)
+
+        r += 1
         ttk.Label(frm, text="服务器地址:").grid(row=r, column=0, sticky="w", pady=4)
         self.e_host = ttk.Entry(frm, width=22)
         self.e_host.grid(row=r, column=1, sticky="w", pady=4)
@@ -131,6 +150,12 @@ class App:
         self.e_maxfail.grid(row=r, column=1, sticky="w", pady=4)
 
         r += 1
+        ttk.Label(frm, text="连接超时(秒):").grid(row=r, column=0, sticky="w", pady=4)
+        self.e_timeout = ttk.Entry(frm, width=22)
+        self.e_timeout.insert(0, "5")
+        self.e_timeout.grid(row=r, column=1, sticky="w", pady=4)
+
+        r += 1
         bfrm = ttk.Frame(frm)
         bfrm.grid(row=r, column=0, columnspan=4, pady=8, sticky="w")
         self.b_start = ttk.Button(bfrm, text="开始探测", command=self.start, width=12)
@@ -138,6 +163,7 @@ class App:
         self.b_stop = ttk.Button(bfrm, text="停止探测", command=self.stop, width=12,
                                  state="disabled")
         self.b_stop.pack(side="left")
+        ttk.Button(bfrm, text="清空日志", command=self._clear_log, width=12).pack(side="left", padx=(40, 0))
 
         r += 1
         ttk.Label(frm, text="参数解析结果:").grid(row=r, column=0, sticky="w", pady=(4, 2))
@@ -160,6 +186,21 @@ class App:
 
         self._poll()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _on_preset(self, _evt=None):
+        name = self.preset_var.get()
+        for n, h, p in PRESETS:
+            if n == name:
+                self.e_host.delete(0, "end")
+                self.e_host.insert(0, h)
+                self.e_port.delete(0, "end")
+                self.e_port.insert(0, str(p) if p else "")
+                break
+
+    def _clear_log(self):
+        self.t_log.config(state="normal")
+        self.t_log.delete("1.0", "end")
+        self.t_log.config(state="disabled")
 
     def _log(self, msg):
         self.t_log.config(state="normal")
@@ -195,6 +236,7 @@ class App:
             threads = self._int(self.e_threads, "线程数", 1, 200)
             max_probe = self._int(self.e_max, "探测上限", 1, 1000000)
             max_fail = self._int(self.e_maxfail, "失败次数", 1, 1000000)
+            timeout = self._int(self.e_timeout, "连接超时", 1, 60)
         except ValueError as e:
             messagebox.showwarning("提示", str(e))
             return
@@ -209,7 +251,7 @@ class App:
         self.b_stop.config(state="normal")
         self.l_ok.config(text="成功连接数: 0")
         self.l_fail.config(text="失败连接数: 0")
-        self.prober = Prober(host, port, interval, threads, max_probe, max_fail, self.ui_q)
+        self.prober = Prober(host, port, interval, threads, max_probe, max_fail, timeout, self.ui_q)
         threading.Thread(target=self.prober.run, daemon=True).start()
 
     def stop(self):
