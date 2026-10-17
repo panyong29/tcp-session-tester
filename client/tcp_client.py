@@ -1,4 +1,4 @@
-"""TCP连接数探测工具 V1.0（NBR 风格）
+"""TCP连接数探测工具 V2.0
 
 多线程持续建连并保持，探测目标的最大 TCP 并发连接数。
 失败数达到阈值或达到探测上限时自动停止。
@@ -14,7 +14,6 @@ APP_VERSION = "2.0"
 
 # 预设测试目标：(显示名, host, port)
 PRESETS = [
-    ("自定义", "", 0),
     ("阿里DNS", "223.6.6.6", 53),
     ("Google DNS", "8.8.8.8", 53),
     ("Cloudflare DNS", "1.1.1.1", 53),
@@ -40,6 +39,10 @@ class Prober:
         self.attempted = 0
         self.success = 0
         self.failed = 0
+        self.consec_failed = 0  # 连续失败计数
+        self.fail_timeout = 0   # 超时失败
+        self.fail_refused = 0   # 被拒绝
+        self.fail_other = 0     # 其他
         self.stop_flag = threading.Event()
         self.threads = []
 
@@ -48,6 +51,8 @@ class Prober:
             self.ui_q.put_nowait({
                 "success": self.success, "failed": self.failed,
                 "attempted": self.attempted, "active": len(self.sockets),
+                "fail_timeout": self.fail_timeout, "fail_refused": self.fail_refused,
+                "fail_other": self.fail_other,
             })
         except queue.Full:
             pass
@@ -55,21 +60,37 @@ class Prober:
     def _worker(self):
         while not self.stop_flag.is_set():
             with self.lock:
-                if self.attempted >= self.max_probe or self.failed >= self.max_fail:
+                if self.attempted >= self.max_probe or self.consec_failed >= self.max_fail:
                     self.stop_flag.set()
                     break
                 self.attempted += 1
             try:
                 s = socket.create_connection((self.host, self.port), timeout=self.timeout)
+            except (socket.timeout, TimeoutError):
+                kind = "timeout"
+            except ConnectionRefusedError:
+                kind = "refused"
             except Exception:  # noqa: BLE001
-                with self.lock:
-                    self.failed += 1
-                self._report()
+                kind = "other"
             else:
-                with self.lock:
+                kind = None
+            with self.lock:
+                if kind is None:
                     self.sockets.append(s)
                     self.success += 1
-                self._report()
+                    self.consec_failed = 0
+                else:
+                    self.failed += 1
+                    self.consec_failed += 1
+                    if kind == "timeout":
+                        self.fail_timeout += 1
+                    elif kind == "refused":
+                        self.fail_refused += 1
+                    else:
+                        self.fail_other += 1
+                    if self.consec_failed >= self.max_fail:
+                        self.stop_flag.set()
+            self._report()
             if self.interval > 0:
                 self.stop_flag.wait(self.interval)  # 可中断的间隔
 
@@ -87,7 +108,9 @@ class Prober:
                 pass
         self.sockets.clear()
         self.ui_q.put({"done": True, "success": self.success,
-                       "failed": self.failed, "attempted": self.attempted})
+                       "failed": self.failed, "attempted": self.attempted,
+                       "fail_timeout": self.fail_timeout, "fail_refused": self.fail_refused,
+                       "fail_other": self.fail_other})
 
     def stop(self):
         self.stop_flag.set()
@@ -144,7 +167,7 @@ class App:
         self.e_max.grid(row=r, column=1, sticky="w", pady=4)
 
         r += 1
-        ttk.Label(frm, text="失败多少次停止探测:").grid(row=r, column=0, sticky="w", pady=4)
+        ttk.Label(frm, text="连续失败几次停止:").grid(row=r, column=0, sticky="w", pady=4)
         self.e_maxfail = ttk.Entry(frm, width=22)
         self.e_maxfail.insert(0, "100")
         self.e_maxfail.grid(row=r, column=1, sticky="w", pady=4)
@@ -180,6 +203,9 @@ class App:
         self.l_ok.pack(side="left", padx=(0, 60))
         self.l_fail = ttk.Label(sfrm, text="失败连接数: 0", font=("", 10))
         self.l_fail.pack(side="left")
+        r += 1
+        self.l_breakdown = ttk.Label(frm, text="", font=("", 9), foreground="gray")
+        self.l_breakdown.grid(row=r, column=0, columnspan=4, sticky="w", pady=1)
         r += 1
         self.t_log = tk.Text(frm, height=10, width=72, state="disabled")
         self.t_log.grid(row=r, column=0, columnspan=4, pady=2)
@@ -243,7 +269,7 @@ class App:
         self._set_param_text(
             f"目标: {host}:{port}\n"
             f"时间间隔: {interval}ms, 线程数: {threads}, "
-            f"探测上限: {max_probe}, 失败{max_fail}次停止")
+            f"探测上限: {max_probe}, 连续失败{max_fail}次停止")
         self._log(f"开始探测 {host}:{port}")
         self.probing = True
         self.t_start = time.time()
@@ -251,6 +277,11 @@ class App:
         self.b_stop.config(state="normal")
         self.l_ok.config(text="成功连接数: 0")
         self.l_fail.config(text="失败连接数: 0")
+        self.l_breakdown.config(text="")
+        self._last_host, self._last_port = host, port
+        self._last_params = {"interval": interval, "threads": threads,
+                             "max_probe": max_probe, "max_fail": max_fail,
+                             "timeout": timeout}
         self.prober = Prober(host, port, interval, threads, max_probe, max_fail, timeout, self.ui_q)
         threading.Thread(target=self.prober.run, daemon=True).start()
 
@@ -260,6 +291,32 @@ class App:
             self.prober.stop()
             self.b_stop.config(state="disabled")
 
+    def _export_csv(self, m):
+        import csv, os
+        fname = f"tcp_probe_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        path = os.path.join(desktop, fname) if os.path.isdir(desktop) \
+            else os.path.join(os.path.expanduser("~"), fname)
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                w.writerow(["目标", f"{self._last_host}:{self._last_port}"])
+                w.writerow(["时间间隔(ms)", self._last_params["interval"]])
+                w.writerow(["线程数", self._last_params["threads"]])
+                w.writerow(["探测上限", self._last_params["max_probe"]])
+                w.writerow(["连续失败停止", self._last_params["max_fail"]])
+                w.writerow(["连接超时(秒)", self._last_params["timeout"]])
+                w.writerow(["成功", m["success"]])
+                w.writerow(["失败", m["failed"]])
+                w.writerow(["超时失败", m.get("fail_timeout", 0)])
+                w.writerow(["拒绝失败", m.get("fail_refused", 0)])
+                w.writerow(["其他失败", m.get("fail_other", 0)])
+                w.writerow(["共尝试", m["attempted"]])
+                w.writerow(["用时(秒)", round(time.time() - self.t_start, 1)])
+            return path
+        except Exception:  # noqa: BLE001
+            return None
+
     def _poll(self):
         try:
             while True:
@@ -268,7 +325,14 @@ class App:
                     el = round(time.time() - self.t_start, 1)
                     self._log(f"探测结束，用时{el}s：成功 {m['success']}，"
                               f"失败 {m['failed']}，共尝试 {m['attempted']}")
+                    bd = (f"超时 {m.get('fail_timeout',0)} / "
+                          f"拒绝 {m.get('fail_refused',0)} / "
+                          f"其他 {m.get('fail_other',0)}")
+                    self._log(f"失败分类：{bd}")
                     self._log(f"结论：目标最大并发连接数约 {m['success']}")
+                    csv_path = self._export_csv(m)
+                    if csv_path:
+                        self._log(f"结果已导出: {csv_path}")
                     self.probing = False
                     self.prober = None
                     self.b_start.config(state="normal")
@@ -276,6 +340,10 @@ class App:
                 else:
                     self.l_ok.config(text=f"成功连接数: {m['success']}")
                     self.l_fail.config(text=f"失败连接数: {m['failed']}")
+                    self.l_breakdown.config(
+                        text=f"超时 {m.get('fail_timeout',0)} / "
+                             f"拒绝 {m.get('fail_refused',0)} / "
+                             f"其他 {m.get('fail_other',0)}")
         except queue.Empty:
             pass
         self.root.after(200, self._poll)
