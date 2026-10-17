@@ -10,7 +10,7 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 
 
 class Prober:
@@ -85,7 +85,7 @@ class Prober:
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("TCP连接数探测工具 V1.0")
+        root.title("TCP连接数探测工具 V1.1")
         root.geometry("620x600")
         root.resizable(False, False)
 
