@@ -12,13 +12,15 @@ from tkinter import messagebox, ttk
 
 APP_VERSION = "2.0"
 
+
 # 预设测试目标：(显示名, host, port)
 PRESETS = [
     ("阿里DNS", "223.6.6.6", 53),
     ("Google DNS", "8.8.8.8", 53),
     ("Cloudflare DNS", "1.1.1.1", 53),
+    ("腾讯DNS", "119.29.29.29", 53),
     ("百度", "www.baidu.com", 80),
-    ("我的服务器", "173.254.227.219", 9000),
+    ("我的服务器", "", 0),
 ]
 
 
@@ -210,6 +212,7 @@ class App:
         self.t_log = tk.Text(frm, height=10, width=72, state="disabled")
         self.t_log.grid(row=r, column=0, columnspan=4, pady=2)
 
+        self._on_preset()  # 启动时按默认预设填充地址端口
         self._poll()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
