@@ -2,7 +2,7 @@
 
 测目标 TCP 服务能扛住多少并发会话。服务端跑在 Docker 里，客户端有三种用法：Windows 有现成 exe，macOS / Linux 终端用命令行版，桌面环境也可以跑图形版源码，填上服务器地址、端口、并发数就能测。
 
-![客户端界面](docs/screenshot.png)
+
 
 ## 服务端（Docker）
 
