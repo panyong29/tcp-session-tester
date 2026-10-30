@@ -1,6 +1,6 @@
 # TCP 会话数测试小工具
 
-测目标 TCP 服务能扛住多少并发会话。服务端跑在 Docker 里，客户端是 Windows 图形小工具，填上服务器地址、端口、并发数就能测。
+测目标 TCP 服务能扛住多少并发会话。服务端跑在 Docker 里，客户端是图形小工具：Windows 有现成 exe，macOS / Linux 直接跑源码，填上服务器地址、端口、并发数就能测。
 
 ![客户端界面](docs/screenshot.png)
 
@@ -28,6 +28,59 @@ docker build -t tcp-session-server ./server
 ## 客户端（Windows）
 
 从 [Releases](../../releases) 页下载 `TcpSessionTester.exe`，双击运行。
+
+## 客户端（macOS / Linux）
+
+macOS / Linux 没有现成 exe，直接跑源码，界面、参数、用法和 Windows 版完全一样（停止 / 自动停止都会立即释放连接，v2.3 起关闭用 RST，不进 TIME_WAIT）。
+
+### 1. 准备 Python 和 tkinter
+
+需要 Python 3.12，客户端除标准库外不依赖任何 pip 包。tkinter 不能用 pip 装（它不是 PyPI 上的包），要走系统包或官方安装包：
+
+- macOS：从 python.org 下载的安装包自带 tkinter；如果是 Homebrew 装的 Python，`python3 -m tkinter` 报错时再补装对应版本，例如 Python 3.12 就装 `brew install python-tk@3.12`（把 3.12 换成你自己的 Python 版本）。
+- Linux（Ubuntu / Debian）：
+
+  ```bash
+  sudo apt install python3 python3-tk
+  ```
+
+  其他发行版装对应的 tkinter 包即可，例如 Fedora 是 `python3-tkinter`。
+
+先验证 tkinter 能用，弹一个测试窗口才算过关：
+
+```bash
+python3 -m tkinter
+```
+
+### 2. 拿到源码并运行
+
+```bash
+git clone https://github.com/panyong29/tcp-session-tester.git
+cd tcp-session-tester
+python3 client/tcp_client.py
+```
+
+也可以在 GitHub 仓库页点 Code → Download ZIP，解压后同样跑 `python3 client/tcp_client.py`。
+
+注意要在桌面会话里跑，不能在没有图形界面的 SSH 里跑，否则会报没有显示设备（no display）。结果 CSV 的导出位置和 Windows 版一样：有桌面文件夹就导到桌面，没有就导到用户主目录。
+
+### 3. 测大并发前先看文件描述符上限
+
+客户端每保持一个连接就占一个文件描述符，测几千并发时如果报 `Too many open files`，先在同一个终端里调大再跑：
+
+```bash
+ulimit -n 65535
+python3 client/tcp_client.py
+```
+
+### 可选：自己打一个单文件程序
+
+```bash
+pip install pyinstaller
+pyinstaller --onefile --windowed --name TcpSessionTester client/tcp_client.py
+```
+
+产物在 `dist/` 目录下，之后双击它就能用，不用每次都敲命令。
 
 参数说明：
 
