@@ -1,6 +1,6 @@
 # TCP 会话数测试小工具
 
-测目标 TCP 服务能扛住多少并发会话。服务端跑在 Docker 里，客户端是图形小工具：Windows 有现成 exe，macOS / Linux 直接跑源码，填上服务器地址、端口、并发数就能测。
+测目标 TCP 服务能扛住多少并发会话。服务端跑在 Docker 里，客户端有三种用法：Windows 有现成 exe，macOS / Linux 终端用命令行版，桌面环境也可以跑图形版源码，填上服务器地址、端口、并发数就能测。
 
 ![客户端界面](docs/screenshot.png)
 
@@ -29,9 +29,49 @@ docker build -t tcp-session-server ./server
 
 从 [Releases](../../releases) 页下载 `TcpSessionTester.exe`，双击运行。
 
-## 客户端（macOS / Linux）
+## 客户端（命令行版，macOS / Linux）
 
-macOS / Linux 没有现成 exe，直接跑源码，界面、参数、用法和 Windows 版完全一样（停止 / 自动停止都会立即释放连接，v2.3 起关闭用 RST，不进 TIME_WAIT）。
+终端用户推荐用命令行版 `client/tcp_cli.py`：clone 下来就能直接跑，不需要 pip 装任何东西，不需要 tkinter，不需要打包，Python 3.12 就够。
+
+```bash
+git clone https://github.com/panyong29/tcp-session-tester.git
+cd tcp-session-tester
+
+# 用预设目标
+python3 client/tcp_cli.py --preset tencent
+
+# 自己填目标：10 线程、间隔 100ms、最多探 5000 个、连续失败 20 次停
+python3 client/tcp_cli.py --host 127.0.0.1 --port 9000 \
+  --threads 10 --interval-ms 100 --max-probe 5000 --max-fail 20
+
+# 测 60 秒就停，并把结果写进 CSV
+python3 client/tcp_cli.py --preset tencent --duration 60 --csv result.csv
+
+# 看有哪些预设、看全部选项
+python3 client/tcp_cli.py --list-presets
+python3 client/tcp_cli.py --help
+```
+
+| 选项 | 说明 |
+|---|---|
+| `--host` / `--port` | 服务器地址 / 端口，例如 `127.0.0.1` / `9000` |
+| `--preset` | 预设目标：`ali` / `google` / `cloudflare` / `tencent` / `baidu`，不填 `--host` / `--port` 时用预设的地址端口 |
+| `--threads` | 线程数，默认 10 |
+| `--interval-ms` | 每次建连尝试之间的间隔（毫秒），默认 100 |
+| `--max-probe` | 探测上限：最多尝试多少个连接，默认 10000 |
+| `--max-fail` | 连续失败几次自动停止，默认 100 |
+| `--timeout` | 单次建连超时（秒），默认 5 |
+| `--duration` | 测定时长（秒），0 表示不限时，默认 0 |
+| `--refresh-ms` | 终端实时刷新间隔（毫秒），默认 200 |
+| `--csv` | 结果 CSV 路径，不填则不写文件 |
+
+探测过程中终端会原地实时刷新：已尝试、成功、失败、当前保持、失败分类（超时 / 拒绝 / 其他）、用时、平均建连速率。按 Ctrl+C 随时停止，探测上限到了、连续失败到了阈值、测定时长到了都会自动停止；手动停止和自动停止都会立即释放全部连接（v2.3 起关闭用 RST，不进 TIME_WAIT），结束时打印最终汇总和停止原因。
+
+注意：clone 下来的 `tcp_cli.py` 权限是 644，不能直接 `./client/tcp_cli.py` 运行，要用上面这种 `python3 client/tcp_cli.py` 的形式；想用 `./` 形式就先跑一次 `chmod +x client/tcp_cli.py`。重定向到文件时不会用 ANSI 清屏，会改成每刷新一次打印一行。
+
+## 客户端（图形版，macOS / Linux）
+
+想要图形界面时，macOS / Linux 没有现成 exe，直接跑图形版源码，界面、参数、用法和 Windows 版完全一样（停止 / 自动停止都会立即释放连接，v2.3 起关闭用 RST，不进 TIME_WAIT）。
 
 ### 1. 准备 Python 和 tkinter
 
@@ -90,9 +130,9 @@ pyinstaller --onefile --windowed --name TcpSessionTester client/tcp_client.py
 | 时间间隔(ms) | 每次建连尝试之间的间隔 |
 | 线程数 | 同时建连的工作线程数 |
 | 探测上限 | 最多尝试多少个连接 |
-| 失败多少次停止探测 | 累计失败达到该次数自动停止 |
+| 失败多少次停止探测 | 连续失败达到该次数自动停止 |
 | 连接超时 | 单次建连超时秒数 |
-| 预设目标 | 一键切换测试目标：阿里DNS (223.6.6.6:53)、Google DNS (8.8.8.8:53)、Cloudflare DNS (1.1.1.1:53)、百度 (www.baidu.com:80)、我的服务器，或自定义 |
+| 预设目标 | 一键切换测试目标：阿里DNS (223.6.6.6:53)、Google DNS (8.8.8.8:53)、Cloudflare DNS (1.1.1.1:53)、腾讯DNS (119.29.29.29:53)、百度 (www.baidu.com:80)、我的服务器，或自定义 |
 
 探测逻辑：多线程持续建连并保持，失败数达阈值或达探测上限时自动停止，成功连接数即目标的最大并发连接数。
 
@@ -104,7 +144,7 @@ pyinstaller --onefile --windowed --name TcpSessionTester client/tcp_client.py
 
 1. 服务端跑在公网 VPS 上（见上）
 2. 家里电脑运行客户端，服务器地址填 VPS 的公网 IP，端口 9000
-3. 模式选"建连保持"，并发连接数从 2000 起测，保持 60 秒
+3. 并发连接数从 2000 起测，保持 60 秒
 4. 逐步加大（4000 → 8000 → 12000…），观察"失败"数何时开始明显上升
 5. 失败率突增的那个并发数，就是这条宽带实际的 TCP 会话上限
 
@@ -112,6 +152,6 @@ pyinstaller --onefile --windowed --name TcpSessionTester client/tcp_client.py
 
 ## 注意事项
 
-- 客户端本机也有上限：Windows 动态端口约 1.6 万个，大量短连接会遇到 TIME_WAIT 占端口；测上万并发建议把客户端也放 Linux 上跑，或调大动态端口范围
+- 客户端本机也有上限：Windows 动态端口约 1.6 万个；v2.3 之前大量短连接会遇到 TIME_WAIT 占端口，v2.3 起停止 / 自动停止用 RST 关闭，不进 TIME_WAIT；测上万并发建议把客户端也放 Linux 上跑，或调大动态端口范围
 - 测公网服务器前先确认对方允许，避免被当成攻击封 IP
 - 经过 NAT/防火墙测试时，关注的往往是中间设备的会话表是否被打满，可对比直连和经过设备的数据
