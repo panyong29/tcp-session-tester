@@ -1,16 +1,23 @@
-"""TCP连接数探测工具 V2.0
+"""TCP连接数探测工具 V2.3
 
 多线程持续建连并保持，探测目标的最大 TCP 并发连接数。
 失败数达到阈值或达到探测上限时自动停止。
+
+停止时立即释放：stop() 当场关掉全部已建连接，不等在途建连
+跑完超时、不等工作线程 join；关闭用 SO_LINGER 0 发 RST，
+本地端口不进 TIME_WAIT、NAT 会话表里也不再残留，
+点停止后立刻看 netstat / 路由器会话数就是干净的。
+本工具只建连不发业务数据，RST 关闭不会丢数据。
 """
 import queue
 import socket
+import struct
 import threading
 import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-APP_VERSION = "2.0"
+APP_VERSION = "2.3"
 
 
 # 预设测试目标：(显示名, host, port)
@@ -48,6 +55,27 @@ class Prober:
         self.stop_flag = threading.Event()
         self.threads = []
 
+    @staticmethod
+    def _close_socket(s):
+        """立即释放一个连接：SO_LINGER 0 发 RST，不进 TIME_WAIT。"""
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                         struct.pack("ii", 1, 0))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            s.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def close_all(self):
+        """当场关掉全部已建连接，返回释放数。线程安全，可重复调。"""
+        with self.lock:
+            sockets, self.sockets = self.sockets, []
+        for s in sockets:
+            self._close_socket(s)
+        return len(sockets)
+
     def _report(self):
         try:
             self.ui_q.put_nowait({
@@ -61,11 +89,18 @@ class Prober:
 
     def _worker(self):
         while not self.stop_flag.is_set():
+            auto_stop = False
             with self.lock:
                 if self.attempted >= self.max_probe or self.consec_failed >= self.max_fail:
                     self.stop_flag.set()
-                    break
-                self.attempted += 1
+                    auto_stop = True
+                else:
+                    self.attempted += 1
+            if auto_stop:
+                # 自动停止也当场释放，不能只置标志等 join：
+                # 否则在途建连跑完超时之前，已建连接还握在手里。
+                self.close_all()
+                break
             try:
                 s = socket.create_connection((self.host, self.port), timeout=self.timeout)
             except (socket.timeout, TimeoutError):
@@ -76,11 +111,18 @@ class Prober:
                 kind = "other"
             else:
                 kind = None
+            to_close = None
+            auto_stop = False
             with self.lock:
                 if kind is None:
-                    self.sockets.append(s)
                     self.success += 1
                     self.consec_failed = 0
+                    if self.stop_flag.is_set():
+                        # 停止后才建成的连接：不进保持列表，当场关掉，
+                        # 否则它会漏到 run() 关完之后、永远没人关。
+                        to_close = s
+                    else:
+                        self.sockets.append(s)
                 else:
                     self.failed += 1
                     self.consec_failed += 1
@@ -92,6 +134,12 @@ class Prober:
                         self.fail_other += 1
                     if self.consec_failed >= self.max_fail:
                         self.stop_flag.set()
+                        auto_stop = True
+            if to_close is not None:
+                self._close_socket(to_close)
+            if auto_stop:
+                # 连续失败触发自动停止：当场释放全部已建连接。
+                self.close_all()
             self._report()
             if self.interval > 0:
                 self.stop_flag.wait(self.interval)  # 可中断的间隔
@@ -103,19 +151,33 @@ class Prober:
             t.start()
         for t in self.threads:
             t.join()
-        for s in self.sockets:
+        # 兜底：关掉 join 后还剩的（正常情况下 stop() 已关完，这里是 0）
+        self.close_all()
+        done = {"done": True, "success": self.success,
+                "failed": self.failed, "attempted": self.attempted,
+                "fail_timeout": self.fail_timeout, "fail_refused": self.fail_refused,
+                "fail_other": self.fail_other}
+        # done 消息必须送达，否则界面永远卡在“正在停止…”。
+        # 原版用阻塞 put，队列满时会在这里卡住；改成丢弃最旧的
+        # 状态上报也要把 done 送出去，绝不阻塞。
+        while True:
             try:
-                s.close()
-            except Exception:  # noqa: BLE001
-                pass
-        self.sockets.clear()
-        self.ui_q.put({"done": True, "success": self.success,
-                       "failed": self.failed, "attempted": self.attempted,
-                       "fail_timeout": self.fail_timeout, "fail_refused": self.fail_refused,
-                       "fail_other": self.fail_other})
+                self.ui_q.put_nowait(done)
+                break
+            except queue.Full:
+                try:
+                    self.ui_q.get_nowait()
+                except queue.Empty:
+                    break
 
     def stop(self):
+        """停止探测并当场释放全部已建连接，返回释放数。
+
+        只置标志是不够的：原版要等在途建连跑完超时、工作线程
+        join 后才关，停止后连接还握在手里一段时间。
+        """
         self.stop_flag.set()
+        return self.close_all()
 
 
 class App:
@@ -290,8 +352,8 @@ class App:
 
     def stop(self):
         if self.probing and self.prober:
-            self._log("正在停止…")
-            self.prober.stop()
+            released = self.prober.stop()
+            self._log(f"正在停止…已释放 {released} 个连接")
             self.b_stop.config(state="disabled")
 
     def _export_csv(self, m):
@@ -333,6 +395,7 @@ class App:
                           f"其他 {m.get('fail_other',0)}")
                     self._log(f"失败分类：{bd}")
                     self._log(f"结论：目标最大并发连接数约 {m['success']}")
+                    self._log("连接已全部释放")
                     csv_path = self._export_csv(m)
                     if csv_path:
                         self._log(f"结果已导出: {csv_path}")
@@ -353,6 +416,7 @@ class App:
 
     def on_close(self):
         if self.prober:
+            # stop() 已当场关掉全部连接，关窗口不会再漏连接。
             self.prober.stop()
         self.root.destroy()
 
