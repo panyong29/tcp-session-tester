@@ -134,7 +134,7 @@ pyinstaller --onefile --windowed --name TcpSessionTester client/tcp_client.py
 | 探测上限 | 最多尝试多少个连接 |
 | 失败多少次停止探测 | 连续失败达到该次数自动停止 |
 | 连接超时 | 单次建连超时秒数 |
-| 预设目标 | 一键切换测试目标：阿里DNS (223.6.6.6:53)、Google DNS (8.8.8.8:53)、Cloudflare DNS (1.1.1.1:53)、腾讯DNS (119.29.29.29:53)、百度 (www.baidu.com:80)、 我的服务器 |
+| 预设目标 | 一键切换测试目标：阿里DNS (223.6.6.6:53)、Google DNS (8.8.8.8:53)、Cloudflare DNS (1.1.1.1:53)、腾讯DNS (119.29.29.29:53)、百度 (www.baidu.com:80) 、 我的服务器 |
 
 探测逻辑：多线程持续建连并保持，失败数达阈值或达探测上限时自动停止，成功连接数即目标的最大并发连接数。
 
