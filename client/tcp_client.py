@@ -1,4 +1,4 @@
-"""TCP连接数探测工具 V2.3
+"""TCP连接数探测工具 V2.4
 
 多线程持续建连并保持，探测目标的最大 TCP 并发连接数。
 失败数达到阈值或达到探测上限时自动停止。
@@ -8,16 +8,120 @@
 本地端口不进 TIME_WAIT、NAT 会话表里也不再残留，
 点停止后立刻看 netstat / 路由器会话数就是干净的。
 本工具只建连不发业务数据，RST 关闭不会丢数据。
+
+V2.4 新增：界面右侧实时显示本进程连接占用（Windows 上用
+系统 TCP 表实测，非 Windows 上用程序内计数兜底）。
+注意 Bound 的坑：Windows 会把同一个客户端 socket 报两次，
+一次是 Bound（通配地址 0.0.0.0），一次是它真正的 TCP 状态
+（本机 IP + 远端），两条的本地端口完全相同。所以合计必须
+按本地端口去重，绝不能把 Bound 再加一遍，否则总数会翻倍。
 """
+import os
 import queue
 import socket
 import struct
+import sys
 import threading
 import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-APP_VERSION = "2.3"
+APP_VERSION = "2.4"
+
+# MIB_TCP_STATE（Windows TCP 表里的状态码）
+_TCP_STATE_NAMES = {
+    0: "Bound", 1: "Closed", 2: "Listen", 3: "SynSent",
+    4: "SynReceived", 5: "Established", 6: "FinWait1", 7: "FinWait2",
+    8: "CloseWait", 9: "Closing", 10: "LastAck", 11: "TimeWait",
+    12: "DeleteTCB",
+}
+
+
+def _app_tcp_counts(prober):
+    """程序内计数兜底：非 Windows、或系统表读不到时用它。"""
+    held = len(prober.sockets) if prober is not None else 0
+    inflight = 0
+    if prober is not None:
+        inflight = max(0, prober.attempted - prober.success - prober.failed)
+    return {
+        "distinct": held + inflight, "established": held,
+        "synsent": inflight, "bound": held + inflight, "listen": 0,
+        "time_wait": 0, "close_wait": 0, "other": 0,
+        "held": held, "source": "程序内计数",
+    }
+
+
+def _win_tcp_counts(prober):
+    """Windows：用 GetExtendedTcpTable 读本进程的 TCP 表（只读，不改系统）。
+
+    只统计本进程（os.getpid()），不碰其他进程。返回的 distinct
+    按本地端口去重：Bound 条目和 Established/SynSent 条目共享
+    同一个本地端口，去重后恰好等于 Bound 数，不会翻倍。
+    """
+    import ctypes
+
+    class Row(ctypes.Structure):
+        _fields_ = [("dwState", ctypes.c_ulong),
+                    ("dwLocalAddr", ctypes.c_ulong),
+                    ("dwLocalPort", ctypes.c_ulong),
+                    ("dwRemoteAddr", ctypes.c_ulong),
+                    ("dwRemotePort", ctypes.c_ulong),
+                    ("dwOwningPid", ctypes.c_ulong)]
+
+    iphlpapi = ctypes.windll.iphlpapi
+    size = ctypes.c_ulong(0)
+    # TCP_TABLE_OWNER_PID_ALL = 5，AF_INET = 2；先问一遍要多大缓冲。
+    iphlpapi.GetExtendedTcpTable(None, ctypes.byref(size), False, 2, 5, 0)
+    if size.value == 0:
+        raise OSError("TCP 表缓冲大小为 0")
+    buf = ctypes.create_string_buffer(size.value)
+    if iphlpapi.GetExtendedTcpTable(buf, ctypes.byref(size), False, 2, 5, 0) != 0:
+        raise OSError("GetExtendedTcpTable 失败")
+    num = ctypes.cast(buf, ctypes.POINTER(ctypes.c_ulong)).contents.value
+    rows = (Row * num).from_address(ctypes.addressof(buf) + 4)
+    pid = os.getpid()
+    counts = {"established": 0, "synsent": 0, "bound": 0, "listen": 0,
+              "time_wait": 0, "close_wait": 0, "other": 0}
+    distinct_ports = set()
+    for row in rows:
+        if row.dwOwningPid != pid:
+            continue
+        state = row.dwState
+        if state == 2:
+            kind = "listen"
+        elif row.dwRemoteAddr == 0 and row.dwRemotePort == 0 and row.dwLocalPort != 0:
+            # 远端为空、本地端口已占：就是 PowerShell 里看到的 Bound。
+            kind = "bound"
+        elif state == 5:
+            kind = "established"
+        elif state == 3:
+            kind = "synsent"
+        elif state == 11:
+            kind = "time_wait"
+        elif state == 8:
+            kind = "close_wait"
+        elif state in (4, 6, 7, 9, 10):
+            kind = "other"
+        else:
+            continue  # Closed / DeleteTCB / 未知：不计入占用
+        counts[kind] += 1
+        if kind not in ("listen", "time_wait"):
+            distinct_ports.add(row.dwLocalPort)
+    held = len(prober.sockets) if prober is not None else 0
+    counts["distinct"] = len(distinct_ports)
+    counts["held"] = held
+    counts["source"] = "系统 TCP 表实测"
+    return counts
+
+
+def get_own_tcp_counts(prober):
+    """本进程连接占用：Windows 优先用系统表，其他平台用程序内计数。"""
+    if sys.platform == "win32":
+        try:
+            return _win_tcp_counts(prober)
+        except Exception:  # noqa: BLE001
+            pass
+    return _app_tcp_counts(prober)
 
 
 # 预设测试目标：(显示名, host, port)
@@ -184,16 +288,45 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title(f"TCP连接数探测工具 V{APP_VERSION}")
-        root.geometry("620x600")
+        root.geometry("880x600")
         root.resizable(False, False)
 
         self.ui_q = queue.Queue(maxsize=100)
         self.prober = None
         self.probing = False
         self.t_start = 0
+        self.peak_distinct = 0
 
         frm = ttk.Frame(root, padding=10)
-        frm.pack(fill="both", expand=True)
+        frm.pack(side="left", fill="both", expand=True)
+
+        # 右侧实时占用面板：只读显示，不改任何探测逻辑。
+        rfrm = ttk.LabelFrame(root, text="本进程连接占用", padding=10)
+        rfrm.pack(side="right", fill="y", padx=(0, 10), pady=10)
+        self.l_usage_total = ttk.Label(rfrm, text="去重合计: 0", font=("", 14, "bold"))
+        self.l_usage_total.pack(anchor="w", pady=(0, 8))
+        self.l_usage_est = ttk.Label(rfrm, text="Established: 0")
+        self.l_usage_est.pack(anchor="w", pady=2)
+        self.l_usage_syn = ttk.Label(rfrm, text="SynSent (在途): 0")
+        self.l_usage_syn.pack(anchor="w", pady=2)
+        self.l_usage_bound = ttk.Label(rfrm, text="Bound: 0")
+        self.l_usage_bound.pack(anchor="w", pady=2)
+        self.l_usage_listen = ttk.Label(rfrm, text="Listen: 0")
+        self.l_usage_listen.pack(anchor="w", pady=2)
+        self.l_usage_timewait = ttk.Label(rfrm, text="TIME_WAIT: 0")
+        self.l_usage_timewait.pack(anchor="w", pady=2)
+        self.l_usage_closewait = ttk.Label(rfrm, text="CLOSE_WAIT: 0")
+        self.l_usage_closewait.pack(anchor="w", pady=2)
+        self.l_usage_other = ttk.Label(rfrm, text="其他状态: 0")
+        self.l_usage_other.pack(anchor="w", pady=2)
+        self.l_usage_held = ttk.Label(rfrm, text="程序内保持: 0")
+        self.l_usage_held.pack(anchor="w", pady=(8, 2))
+        self.l_usage_peak = ttk.Label(rfrm, text="本轮峰值: 0")
+        self.l_usage_peak.pack(anchor="w", pady=2)
+        self.l_usage_source = ttk.Label(rfrm, text="来源: --", foreground="gray", font=("", 9))
+        self.l_usage_source.pack(anchor="w", pady=(8, 2))
+        ttk.Label(rfrm, text="注：Bound 与 Established /\nSynSent 是同一批端口的\n另一面，合计已去重，\n不要再把 Bound 加一遍，\n否则总数会翻倍。",
+                  foreground="gray", font=("", 9), wraplength=200, justify="left").pack(anchor="w", pady=(4, 0))
 
         r = 0
         ttk.Label(frm, text="预设目标:").grid(row=r, column=0, sticky="w", pady=4)
@@ -276,7 +409,29 @@ class App:
 
         self._on_preset()  # 启动时按默认预设填充地址端口
         self._poll()
+        self._refresh_usage()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _refresh_usage(self):
+        """每 500ms 刷新一次右侧占用面板，失败也不影响探测。"""
+        try:
+            c = get_own_tcp_counts(self.prober if self.probing else None)
+            if self.probing and c["distinct"] > self.peak_distinct:
+                self.peak_distinct = c["distinct"]
+            self.l_usage_total.config(text=f"去重合计: {c['distinct']}")
+            self.l_usage_est.config(text=f"Established: {c['established']}")
+            self.l_usage_syn.config(text=f"SynSent (在途): {c['synsent']}")
+            self.l_usage_bound.config(text=f"Bound: {c['bound']}")
+            self.l_usage_listen.config(text=f"Listen: {c['listen']}")
+            self.l_usage_timewait.config(text=f"TIME_WAIT: {c['time_wait']}")
+            self.l_usage_closewait.config(text=f"CLOSE_WAIT: {c['close_wait']}")
+            self.l_usage_other.config(text=f"其他状态: {c['other']}")
+            self.l_usage_held.config(text=f"程序内保持: {c['held']}")
+            self.l_usage_peak.config(text=f"本轮峰值: {self.peak_distinct}")
+            self.l_usage_source.config(text=f"来源: {c['source']}")
+        except Exception:  # noqa: BLE001
+            pass
+        self.root.after(500, self._refresh_usage)
 
     def _on_preset(self, _evt=None):
         name = self.preset_var.get()
@@ -337,6 +492,7 @@ class App:
             f"探测上限: {max_probe}, 连续失败{max_fail}次停止")
         self._log(f"开始探测 {host}:{port}")
         self.probing = True
+        self.peak_distinct = 0
         self.t_start = time.time()
         self.b_start.config(state="disabled")
         self.b_stop.config(state="normal")
