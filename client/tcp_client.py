@@ -1,4 +1,4 @@
-"""TCP连接数探测工具 V2.6
+"""TCP连接数探测工具 V2.7
 
 多线程持续建连并保持，探测目标的最大 TCP 并发连接数。
 失败数达到阈值或达到探测上限时自动停止。
@@ -15,7 +15,12 @@ V2.5 纠正方向：右侧面板不再只看测试程序自己，改成当前
 Windows 全部进程的会话数、按活动连接数从高到低排序，前 25 名，
 列只有 PID、进程名、活动连接数。V2.6：左侧加“在途”数，成功 + 在途 = 右侧测试程序的活动连接数，
 不再让人以为显示错了；右侧只列活动连接数 > 0 的进程，0 的行不再出现；进程名先用受限查询
-（PROCESS_QUERY_LIMITED_INFORMATION），查不到的下次再试，不再一律缓存为未知。注意 Bound 的坑：Windows 会把同一个客户端 socket 报两次，
+（PROCESS_QUERY_LIMITED_INFORMATION），查不到的下次再试，不再一律缓存为未知。
+V2.7：左右统一刷新。之前左侧 200ms 走队列、右侧 1000ms 走系统表，
+两个快照最多差 800ms，探测中每秒约 100 次尝试，差几十个很正常，
+看着就像显示错了。现在左右都在同一个 500ms 节点里刷：先读探测器
+快照更新左侧，再读系统表更新右侧，中间只差几毫秒，差值只剩
+正在状态切换的那一两个连接。注意 Bound 的坑：Windows 会把同一个客户端 socket 报两次，
 一次是 Bound（通配地址 0.0.0.0），一次是它真正的 TCP 状态
 （本机 IP + 远端），两条的本地端口完全相同。所以每个进程的
 合计必须按本地端口去重，绝不能把 Bound 再加一遍，否则总数
@@ -32,7 +37,7 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-APP_VERSION = "2.6"
+APP_VERSION = "2.7"
 
 # MIB_TCP_STATE（Windows TCP 表里的状态码）
 _TCP_STATE_NAMES = {
@@ -274,6 +279,22 @@ class Prober:
             self._close_socket(s)
         return len(sockets)
 
+    def snapshot(self):
+        """同一时刻的计数快照（锁内读，供界面统一刷新用）。
+
+        inflight = 已尝试 − 成功 − 失败；成功 + 在途 = 系统表里
+        测试程序的活动连接数（不计正在状态切换的那一两个）。
+        """
+        with self.lock:
+            attempted, success, failed = self.attempted, self.success, self.failed
+            held = len(self.sockets)
+            return {
+                "success": success, "failed": failed, "attempted": attempted,
+                "held": held, "inflight": max(0, attempted - success - failed),
+                "fail_timeout": self.fail_timeout, "fail_refused": self.fail_refused,
+                "fail_other": self.fail_other,
+            }
+
     def _report(self):
         try:
             self.ui_q.put_nowait({
@@ -495,8 +516,23 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _refresh_usage(self):
-        """每 1 秒刷新一次右侧全部进程表，失败也不影响探测。"""
+        """左右统一刷新：每 500ms 一个节点，先刷左侧、再刷右侧。
+
+        左侧直接读探测器快照（不用队列里的旧消息），右侧紧接着
+        读系统表，两者只差几毫秒。探测中时左侧成功 + 在途应约
+        等于右侧测试程序的活动连接数，差值只剩正在状态切换的
+        一两个连接。不探测时不碰左侧累计数，只刷右侧表。
+        """
         try:
+            if self.probing and self.prober is not None:
+                s = self.prober.snapshot()
+                self.l_ok.config(text=f"成功连接数: {s['success']}")
+                self.l_fail.config(text=f"失败连接数: {s['failed']}")
+                self.l_inflight.config(text=f"在途: {s['inflight']}")
+                self.l_breakdown.config(
+                    text=f"超时 {s['fail_timeout']} / "
+                         f"拒绝 {s['fail_refused']} / "
+                         f"其他 {s['fail_other']}")
             rows, tester, _source = get_all_process_tcp_counts(
                 self.prober if self.probing else None, self._name_cache)
             for item in self.tree_usage.get_children():
@@ -507,7 +543,7 @@ class App:
                     d["pid"], d.get("name", "未知"), d["distinct"]), tags=tag)
         except Exception:  # noqa: BLE001
             pass
-        self.root.after(1000, self._refresh_usage)
+        self.root.after(500, self._refresh_usage)
 
     def _on_preset(self, _evt=None):
         name = self.preset_var.get()
@@ -615,6 +651,14 @@ class App:
             return None
 
     def _poll(self):
+        """只处理结束消息和日志：日常计数改由统一刷新直接读快照。
+
+        之前日常计数走队列：工作线程每尝试一次才发一条消息，
+        界面 200ms 轮询取到的永远是上一次尝试时的旧数，而右侧
+        系统表是 1000ms 后的新数，两边快照差 800ms，探测中每秒
+        约 100 次尝试，差几十个是必然的。现在日常消息只排空丢弃，
+        计数全部由 _refresh_usage 在同一个 500ms 节点里刷。
+        """
         try:
             while True:
                 m = self.ui_q.get_nowait()
@@ -633,20 +677,14 @@ class App:
                         self._log(f"结果已导出: {csv_path}")
                     self.probing = False
                     self.prober = None
+                    # 结束时左侧定格在最终累计数，在途归零；右侧表
+                    # 下一轮刷新会把已释放的测试程序行去掉。
+                    self.l_ok.config(text=f"成功连接数: {m['success']}")
+                    self.l_fail.config(text=f"失败连接数: {m['failed']}")
                     self.l_inflight.config(text="在途: 0")
                     self.b_start.config(state="normal")
                     self.b_stop.config(state="disabled")
-                else:
-                    self.l_ok.config(text=f"成功连接数: {m['success']}")
-                    self.l_fail.config(text=f"失败连接数: {m['failed']}")
-                    # 在途 = 已尝试 − 成功 − 失败：成功 + 在途 = 右侧活动连接数，
-                    # 这样左右两边能对上，不再像显示错了。
-                    self.l_inflight.config(
-                        text=f"在途: {max(0, m['attempted'] - m['success'] - m['failed'])}")
-                    self.l_breakdown.config(
-                        text=f"超时 {m.get('fail_timeout',0)} / "
-                             f"拒绝 {m.get('fail_refused',0)} / "
-                             f"其他 {m.get('fail_other',0)}")
+                # 非结束消息：排空丢弃，计数不走这里。
         except queue.Empty:
             pass
         self.root.after(200, self._poll)
