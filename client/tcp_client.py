@@ -1,4 +1,4 @@
-"""TCP连接数探测工具 V2.5
+"""TCP连接数探测工具 V2.6
 
 多线程持续建连并保持，探测目标的最大 TCP 并发连接数。
 失败数达到阈值或达到探测上限时自动停止。
@@ -13,7 +13,9 @@ V2.4 新增：界面右侧实时显示本进程连接占用（Windows 上用
 系统 TCP 表实测，非 Windows 上用程序内计数兜底）。
 V2.5 纠正方向：右侧面板不再只看测试程序自己，改成当前
 Windows 全部进程的会话数、按活动连接数从高到低排序，前 25 名，
-列只有 PID、进程名、活动连接数。注意 Bound 的坑：Windows 会把同一个客户端 socket 报两次，
+列只有 PID、进程名、活动连接数。V2.6：左侧加“在途”数，成功 + 在途 = 右侧测试程序的活动连接数，
+不再让人以为显示错了；右侧只列活动连接数 > 0 的进程，0 的行不再出现；进程名先用受限查询
+（PROCESS_QUERY_LIMITED_INFORMATION），查不到的下次再试，不再一律缓存为未知。注意 Bound 的坑：Windows 会把同一个客户端 socket 报两次，
 一次是 Bound（通配地址 0.0.0.0），一次是它真正的 TCP 状态
 （本机 IP + 远端），两条的本地端口完全相同。所以每个进程的
 合计必须按本地端口去重，绝不能把 Bound 再加一遍，否则总数
@@ -30,7 +32,7 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-APP_VERSION = "2.5"
+APP_VERSION = "2.6"
 
 # MIB_TCP_STATE（Windows TCP 表里的状态码）
 _TCP_STATE_NAMES = {
@@ -136,20 +138,40 @@ def _win_all_tcp_rows():
 
 
 def _win_process_name(pid, cache):
-    """Windows：按 PID 查进程名（只读，查不到就回退）。"""
+    """Windows：按 PID 查进程名（只读）。
+
+    先用受限查询 QueryFullProcessImageName（PROCESS_QUERY_LIMITED_
+    INFORMATION = 0x1000）：这个权限要求低，SYSTEM 服务等很多进程
+    都能查到，之前只用 VM_READ（0x0410）+ GetModuleBaseName 时，
+    这些进程会因权限不足直接变成“未知”。受限查询失败时再回退
+    到老办法。查成功的才进缓存，查不到的不缓存，下次刷新再试，
+    避免一次失败就永远显示未知。
+    """
     if pid in cache:
         return cache[pid]
     if pid == 0:
-        name = "Idle"
-    elif pid == 4:
-        name = "System"
-    else:
-        name = "未知"
-        try:
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            psapi = ctypes.windll.psapi
-            # PROCESS_QUERY_INFORMATION(0x0400) | PROCESS_VM_READ(0x0010)
+        cache[pid] = "Idle"
+        return "Idle"
+    if pid == 4:
+        cache[pid] = "System"
+        return "System"
+    name = "未知"
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        psapi = ctypes.windll.psapi
+        # 1) 受限查询：权限要求最低，覆盖面最广。
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if handle:
+            try:
+                buf = ctypes.create_unicode_buffer(260)
+                size = ctypes.c_ulong(260)
+                if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                    name = os.path.basename(buf.value) or name
+            finally:
+                kernel32.CloseHandle(handle)
+        # 2) 回退：老办法。
+        if name == "未知":
             handle = kernel32.OpenProcess(0x0410, False, pid)
             if handle:
                 try:
@@ -158,9 +180,10 @@ def _win_process_name(pid, cache):
                         name = buf.value or name
                 finally:
                     kernel32.CloseHandle(handle)
-        except Exception:  # noqa: BLE001
-            pass
-    cache[pid] = name
+    except Exception:  # noqa: BLE001
+        pass
+    if name != "未知":
+        cache[pid] = name
     return name
 
 
@@ -173,7 +196,10 @@ def get_all_process_tcp_counts(prober, name_cache):
     """
     if sys.platform == "win32":
         try:
-            rows = _aggregate_tcp_rows(_win_all_tcp_rows())
+            # 只列活动连接数 > 0 的进程：只监听、只 TIME_WAIT 的进程
+            # 活动数是 0，列出来只会占满表尾、还多半是未知名。
+            rows = [d for d in _aggregate_tcp_rows(_win_all_tcp_rows())
+                    if d["distinct"] > 0]
             own_pid = os.getpid()
             for d in rows:
                 d["name"] = _win_process_name(d["pid"], name_cache)
@@ -189,7 +215,7 @@ def get_all_process_tcp_counts(prober, name_cache):
     own = _app_tcp_counts(prober)
     _fallback_name = os.path.basename(sys.argv[0]) if sys.argv else ""
     own["name"] = _fallback_name if _fallback_name not in ("", "-") else "TcpSessionTester"
-    return [own], own, "程序内"
+    return ([own] if own["distinct"] > 0 else []), own, "程序内"
 
 
 # 预设测试目标：(显示名, host, port)
@@ -453,7 +479,9 @@ class App:
         self.l_ok = ttk.Label(sfrm, text="成功连接数: 0", font=("", 10))
         self.l_ok.pack(side="left", padx=(0, 60))
         self.l_fail = ttk.Label(sfrm, text="失败连接数: 0", font=("", 10))
-        self.l_fail.pack(side="left")
+        self.l_fail.pack(side="left", padx=(0, 60))
+        self.l_inflight = ttk.Label(sfrm, text="在途: 0", font=("", 10))
+        self.l_inflight.pack(side="left")
         r += 1
         self.l_breakdown = ttk.Label(frm, text="", font=("", 9), foreground="gray")
         self.l_breakdown.grid(row=r, column=0, columnspan=4, sticky="w", pady=1)
@@ -545,6 +573,7 @@ class App:
         self.b_stop.config(state="normal")
         self.l_ok.config(text="成功连接数: 0")
         self.l_fail.config(text="失败连接数: 0")
+        self.l_inflight.config(text="在途: 0")
         self.l_breakdown.config(text="")
         self._last_host, self._last_port = host, port
         self._last_params = {"interval": interval, "threads": threads,
@@ -604,11 +633,16 @@ class App:
                         self._log(f"结果已导出: {csv_path}")
                     self.probing = False
                     self.prober = None
+                    self.l_inflight.config(text="在途: 0")
                     self.b_start.config(state="normal")
                     self.b_stop.config(state="disabled")
                 else:
                     self.l_ok.config(text=f"成功连接数: {m['success']}")
                     self.l_fail.config(text=f"失败连接数: {m['failed']}")
+                    # 在途 = 已尝试 − 成功 − 失败：成功 + 在途 = 右侧活动连接数，
+                    # 这样左右两边能对上，不再像显示错了。
+                    self.l_inflight.config(
+                        text=f"在途: {max(0, m['attempted'] - m['success'] - m['failed'])}")
                     self.l_breakdown.config(
                         text=f"超时 {m.get('fail_timeout',0)} / "
                              f"拒绝 {m.get('fail_refused',0)} / "
