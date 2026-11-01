@@ -1,4 +1,4 @@
-"""TCP连接数探测工具 V2.4
+"""TCP连接数探测工具 V2.5
 
 多线程持续建连并保持，探测目标的最大 TCP 并发连接数。
 失败数达到阈值或达到探测上限时自动停止。
@@ -11,10 +11,14 @@
 
 V2.4 新增：界面右侧实时显示本进程连接占用（Windows 上用
 系统 TCP 表实测，非 Windows 上用程序内计数兜底）。
-注意 Bound 的坑：Windows 会把同一个客户端 socket 报两次，
+V2.5 纠正方向：右侧面板不再只看测试程序自己，改成当前
+Windows 全部进程的会话数、按活动连接数从高到低排序，前 25 名，
+列只有 PID、进程名、活动连接数。注意 Bound 的坑：Windows 会把同一个客户端 socket 报两次，
 一次是 Bound（通配地址 0.0.0.0），一次是它真正的 TCP 状态
-（本机 IP + 远端），两条的本地端口完全相同。所以合计必须
-按本地端口去重，绝不能把 Bound 再加一遍，否则总数会翻倍。
+（本机 IP + 远端），两条的本地端口完全相同。所以每个进程的
+合计必须按本地端口去重，绝不能把 Bound 再加一遍，否则总数
+会翻倍（例如测试程序 Established 489 + 在途 10 = 去重 499，
+不是 998）。
 """
 import os
 import queue
@@ -26,7 +30,7 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-APP_VERSION = "2.4"
+APP_VERSION = "2.5"
 
 # MIB_TCP_STATE（Windows TCP 表里的状态码）
 _TCP_STATE_NAMES = {
@@ -37,6 +41,56 @@ _TCP_STATE_NAMES = {
 }
 
 
+def _classify_row(state, local_port, remote_addr, remote_port):
+    """把一条 TCP 表记录归到一类；返回 None 表示不计入占用。"""
+    if state == 2:
+        return "listen"
+    if remote_addr == 0 and remote_port == 0 and local_port != 0:
+        # 远端为空、本地端口已占：就是 PowerShell 里看到的 Bound。
+        return "bound"
+    if state == 5:
+        return "established"
+    if state == 3:
+        return "synsent"
+    if state == 11:
+        return "time_wait"
+    if state == 8:
+        return "close_wait"
+    if state in (4, 6, 7, 9, 10):
+        return "other"
+    return None  # Closed / DeleteTCB / 未知
+
+
+def _aggregate_tcp_rows(rows):
+    """按 PID 聚合 TCP 表记录，并按去重合计从高到低排序。
+
+    rows 是 (pid, state, local_port, remote_addr, remote_port) 元组。
+    distinct 按本地端口去重：Bound 条目和 Established/SynSent 条目
+    共享同一个本地端口，去重后恰好等于 Bound 数，不会翻倍。
+    Listen 和 TIME_WAIT 不计入 distinct（前者不是连接，后者已无
+    socket 句柄、且 V2.3 的 RST 关闭本来就不会产生 TIME_WAIT）。
+    纯函数，方便在非 Windows 上用模拟数据单测。
+    """
+    per_pid = {}
+    for pid, state, local_port, remote_addr, remote_port in rows:
+        kind = _classify_row(state, local_port, remote_addr, remote_port)
+        if kind is None:
+            continue
+        d = per_pid.setdefault(pid, {
+            "pid": pid, "established": 0, "synsent": 0, "bound": 0,
+            "listen": 0, "time_wait": 0, "close_wait": 0, "other": 0,
+            "_ports": set()})
+        d[kind] += 1
+        if kind not in ("listen", "time_wait"):
+            d["_ports"].add(local_port)
+    result = []
+    for d in per_pid.values():
+        d["distinct"] = len(d.pop("_ports"))
+        result.append(d)
+    result.sort(key=lambda x: x["distinct"], reverse=True)
+    return result
+
+
 def _app_tcp_counts(prober):
     """程序内计数兜底：非 Windows、或系统表读不到时用它。"""
     held = len(prober.sockets) if prober is not None else 0
@@ -44,19 +98,17 @@ def _app_tcp_counts(prober):
     if prober is not None:
         inflight = max(0, prober.attempted - prober.success - prober.failed)
     return {
-        "distinct": held + inflight, "established": held,
+        "pid": os.getpid(), "distinct": held + inflight, "established": held,
         "synsent": inflight, "bound": held + inflight, "listen": 0,
-        "time_wait": 0, "close_wait": 0, "other": 0,
-        "held": held, "source": "程序内计数",
+        "time_wait": 0, "close_wait": 0, "other": 0, "held": held,
     }
 
 
-def _win_tcp_counts(prober):
-    """Windows：用 GetExtendedTcpTable 读本进程的 TCP 表（只读，不改系统）。
+def _win_all_tcp_rows():
+    """Windows：用 GetExtendedTcpTable 读全部进程的 IPv4 TCP 表（只读）。
 
-    只统计本进程（os.getpid()），不碰其他进程。返回的 distinct
-    按本地端口去重：Bound 条目和 Established/SynSent 条目共享
-    同一个本地端口，去重后恰好等于 Bound 数，不会翻倍。
+    只读系统表，不改任何进程、不结束任何连接。仅统计 IPv4，
+    IPv6 暂不计（预设目标均为 IPv4 地址，当前探测不受影响）。
     """
     import ctypes
 
@@ -79,49 +131,65 @@ def _win_tcp_counts(prober):
         raise OSError("GetExtendedTcpTable 失败")
     num = ctypes.cast(buf, ctypes.POINTER(ctypes.c_ulong)).contents.value
     rows = (Row * num).from_address(ctypes.addressof(buf) + 4)
-    pid = os.getpid()
-    counts = {"established": 0, "synsent": 0, "bound": 0, "listen": 0,
-              "time_wait": 0, "close_wait": 0, "other": 0}
-    distinct_ports = set()
-    for row in rows:
-        if row.dwOwningPid != pid:
-            continue
-        state = row.dwState
-        if state == 2:
-            kind = "listen"
-        elif row.dwRemoteAddr == 0 and row.dwRemotePort == 0 and row.dwLocalPort != 0:
-            # 远端为空、本地端口已占：就是 PowerShell 里看到的 Bound。
-            kind = "bound"
-        elif state == 5:
-            kind = "established"
-        elif state == 3:
-            kind = "synsent"
-        elif state == 11:
-            kind = "time_wait"
-        elif state == 8:
-            kind = "close_wait"
-        elif state in (4, 6, 7, 9, 10):
-            kind = "other"
-        else:
-            continue  # Closed / DeleteTCB / 未知：不计入占用
-        counts[kind] += 1
-        if kind not in ("listen", "time_wait"):
-            distinct_ports.add(row.dwLocalPort)
-    held = len(prober.sockets) if prober is not None else 0
-    counts["distinct"] = len(distinct_ports)
-    counts["held"] = held
-    counts["source"] = "系统 TCP 表实测"
-    return counts
+    return [(row.dwOwningPid, row.dwState, row.dwLocalPort,
+             row.dwRemoteAddr, row.dwRemotePort) for row in rows]
 
 
-def get_own_tcp_counts(prober):
-    """本进程连接占用：Windows 优先用系统表，其他平台用程序内计数。"""
-    if sys.platform == "win32":
+def _win_process_name(pid, cache):
+    """Windows：按 PID 查进程名（只读，查不到就回退）。"""
+    if pid in cache:
+        return cache[pid]
+    if pid == 0:
+        name = "Idle"
+    elif pid == 4:
+        name = "System"
+    else:
+        name = "未知"
         try:
-            return _win_tcp_counts(prober)
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            psapi = ctypes.windll.psapi
+            # PROCESS_QUERY_INFORMATION(0x0400) | PROCESS_VM_READ(0x0010)
+            handle = kernel32.OpenProcess(0x0410, False, pid)
+            if handle:
+                try:
+                    buf = ctypes.create_unicode_buffer(260)
+                    if psapi.GetModuleBaseNameW(handle, None, buf, 260):
+                        name = buf.value or name
+                finally:
+                    kernel32.CloseHandle(handle)
         except Exception:  # noqa: BLE001
             pass
-    return _app_tcp_counts(prober)
+    cache[pid] = name
+    return name
+
+
+def get_all_process_tcp_counts(prober, name_cache):
+    """全部进程的会话数（已按去重合计排好序）+ 测试程序自己那行。
+
+    返回 (rows, tester_row, source)：rows 是前 25 名之外的全部排序
+    结果由调用方截取；tester_row 是本进程那行（表里没有时为 0 行）。
+    Windows 优先用系统表，其他平台只返回本进程的程序内计数。
+    """
+    if sys.platform == "win32":
+        try:
+            rows = _aggregate_tcp_rows(_win_all_tcp_rows())
+            own_pid = os.getpid()
+            for d in rows:
+                d["name"] = _win_process_name(d["pid"], name_cache)
+            tester = next((d for d in rows if d["pid"] == own_pid), None)
+            if tester is None:
+                tester = {"pid": own_pid, "distinct": 0, "established": 0,
+                          "synsent": 0, "bound": 0, "listen": 0,
+                          "time_wait": 0, "close_wait": 0, "other": 0,
+                          "name": _win_process_name(own_pid, name_cache)}
+            return rows, tester, "系统表 · IPv4"
+        except Exception:  # noqa: BLE001
+            pass
+    own = _app_tcp_counts(prober)
+    _fallback_name = os.path.basename(sys.argv[0]) if sys.argv else ""
+    own["name"] = _fallback_name if _fallback_name not in ("", "-") else "TcpSessionTester"
+    return [own], own, "程序内"
 
 
 # 预设测试目标：(显示名, host, port)
@@ -288,45 +356,31 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title(f"TCP连接数探测工具 V{APP_VERSION}")
-        root.geometry("880x600")
+        root.geometry("1020x600")
         root.resizable(False, False)
 
         self.ui_q = queue.Queue(maxsize=100)
         self.prober = None
         self.probing = False
         self.t_start = 0
-        self.peak_distinct = 0
+        self._name_cache = {}
 
         frm = ttk.Frame(root, padding=10)
-        frm.pack(side="left", fill="both", expand=True)
+        frm.pack(side="left", fill="y")
 
-        # 右侧实时占用面板：只读显示，不改任何探测逻辑。
-        rfrm = ttk.LabelFrame(root, text="本进程连接占用", padding=10)
-        rfrm.pack(side="right", fill="y", padx=(0, 10), pady=10)
-        self.l_usage_total = ttk.Label(rfrm, text="去重合计: 0", font=("", 14, "bold"))
-        self.l_usage_total.pack(anchor="w", pady=(0, 8))
-        self.l_usage_est = ttk.Label(rfrm, text="Established: 0")
-        self.l_usage_est.pack(anchor="w", pady=2)
-        self.l_usage_syn = ttk.Label(rfrm, text="SynSent (在途): 0")
-        self.l_usage_syn.pack(anchor="w", pady=2)
-        self.l_usage_bound = ttk.Label(rfrm, text="Bound: 0")
-        self.l_usage_bound.pack(anchor="w", pady=2)
-        self.l_usage_listen = ttk.Label(rfrm, text="Listen: 0")
-        self.l_usage_listen.pack(anchor="w", pady=2)
-        self.l_usage_timewait = ttk.Label(rfrm, text="TIME_WAIT: 0")
-        self.l_usage_timewait.pack(anchor="w", pady=2)
-        self.l_usage_closewait = ttk.Label(rfrm, text="CLOSE_WAIT: 0")
-        self.l_usage_closewait.pack(anchor="w", pady=2)
-        self.l_usage_other = ttk.Label(rfrm, text="其他状态: 0")
-        self.l_usage_other.pack(anchor="w", pady=2)
-        self.l_usage_held = ttk.Label(rfrm, text="程序内保持: 0")
-        self.l_usage_held.pack(anchor="w", pady=(8, 2))
-        self.l_usage_peak = ttk.Label(rfrm, text="本轮峰值: 0")
-        self.l_usage_peak.pack(anchor="w", pady=2)
-        self.l_usage_source = ttk.Label(rfrm, text="来源: --", foreground="gray", font=("", 9))
-        self.l_usage_source.pack(anchor="w", pady=(8, 2))
-        ttk.Label(rfrm, text="注：Bound 与 Established /\nSynSent 是同一批端口的\n另一面，合计已去重，\n不要再把 Bound 加一遍，\n否则总数会翻倍。",
-                  foreground="gray", font=("", 9), wraplength=200, justify="left").pack(anchor="w", pady=(4, 0))
+        # 右侧实时占用面板：当前 Windows 全部进程，按去重合计从高到低
+        # 排序，只读显示，不改任何探测逻辑、不结束任何进程。
+        rfrm = ttk.LabelFrame(root, text="当前进程会话数 前25", padding=10)
+        rfrm.pack(side="right", fill="both", expand=True, padx=(0, 10), pady=10)
+        cols = ("pid", "name", "active")
+        self.tree_usage = ttk.Treeview(rfrm, columns=cols, show="headings", height=24)
+        headings = {"pid": "PID", "name": "进程名", "active": "活动连接数"}
+        widths = {"pid": 80, "name": 200, "active": 110}
+        for c in cols:
+            self.tree_usage.heading(c, text=headings[c])
+            self.tree_usage.column(c, width=widths[c], anchor="center" if c != "name" else "w")
+        self.tree_usage.pack(fill="both", expand=True)
+        self.tree_usage.tag_configure("self", background="#fff2cc")
 
         r = 0
         ttk.Label(frm, text="预设目标:").grid(row=r, column=0, sticky="w", pady=4)
@@ -413,25 +467,19 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _refresh_usage(self):
-        """每 500ms 刷新一次右侧占用面板，失败也不影响探测。"""
+        """每 1 秒刷新一次右侧全部进程表，失败也不影响探测。"""
         try:
-            c = get_own_tcp_counts(self.prober if self.probing else None)
-            if self.probing and c["distinct"] > self.peak_distinct:
-                self.peak_distinct = c["distinct"]
-            self.l_usage_total.config(text=f"去重合计: {c['distinct']}")
-            self.l_usage_est.config(text=f"Established: {c['established']}")
-            self.l_usage_syn.config(text=f"SynSent (在途): {c['synsent']}")
-            self.l_usage_bound.config(text=f"Bound: {c['bound']}")
-            self.l_usage_listen.config(text=f"Listen: {c['listen']}")
-            self.l_usage_timewait.config(text=f"TIME_WAIT: {c['time_wait']}")
-            self.l_usage_closewait.config(text=f"CLOSE_WAIT: {c['close_wait']}")
-            self.l_usage_other.config(text=f"其他状态: {c['other']}")
-            self.l_usage_held.config(text=f"程序内保持: {c['held']}")
-            self.l_usage_peak.config(text=f"本轮峰值: {self.peak_distinct}")
-            self.l_usage_source.config(text=f"来源: {c['source']}")
+            rows, tester, _source = get_all_process_tcp_counts(
+                self.prober if self.probing else None, self._name_cache)
+            for item in self.tree_usage.get_children():
+                self.tree_usage.delete(item)
+            for d in rows[:25]:
+                tag = ("self",) if d["pid"] == tester["pid"] else ()
+                self.tree_usage.insert("", "end", values=(
+                    d["pid"], d.get("name", "未知"), d["distinct"]), tags=tag)
         except Exception:  # noqa: BLE001
             pass
-        self.root.after(500, self._refresh_usage)
+        self.root.after(1000, self._refresh_usage)
 
     def _on_preset(self, _evt=None):
         name = self.preset_var.get()
@@ -492,7 +540,6 @@ class App:
             f"探测上限: {max_probe}, 连续失败{max_fail}次停止")
         self._log(f"开始探测 {host}:{port}")
         self.probing = True
-        self.peak_distinct = 0
         self.t_start = time.time()
         self.b_start.config(state="disabled")
         self.b_stop.config(state="normal")
