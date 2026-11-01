@@ -19,12 +19,21 @@ jobs:
         run: pip install pyinstaller
       - name: Build EXE
         run: pyinstaller --onefile --windowed --name TcpSessionTester client/tcp_client.py
+      - name: Read APP_VERSION
+        id: version
+        shell: python
+        run: |
+          import os, re
+          text = open("client/tcp_client.py", encoding="utf-8").read()
+          version = re.search(r'APP_VERSION = "([^"]+)"', text).group(1)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"APP_VERSION={version}\n")
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/TcpSessionTester.exe
           tag_name: build-${{ github.run_number }}
-          name: TcpSessionTester build ${{ github.run_number }}
+          name: "TCP连接数探测工具 V${{ steps.version.outputs.APP_VERSION }} (build ${{ github.run_number }})"
           generate_release_notes: false
   build-server:
     runs-on: ubuntu-latest
