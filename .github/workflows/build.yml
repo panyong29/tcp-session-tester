@@ -1,4 +1,4 @@
-name: Build client EXE & server image
+name: Build clients & server image
 on:
   push:
     branches: [main]
@@ -15,10 +15,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+      - name: Build C# .NET Framework 4.8 client
+        run: msbuild client/winforms-net48/TcpSessionTester.csproj /p:Configuration=Release /p:Platform=AnyCPU
       - name: Install PyInstaller
         run: pip install pyinstaller
-      - name: Build EXE
-        run: pyinstaller --onefile --windowed --name TcpSessionTester client/tcp_client.py
+      - name: Build Python GUI EXE
+        run: pyinstaller --onefile --windowed --name TcpSessionTester-Python client/tcp_client.py
       - name: Read APP_VERSION
         id: version
         shell: python
@@ -31,9 +35,15 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/TcpSessionTester.exe
+          files: |
+            client/winforms-net48/bin/Release/TcpSessionTester.exe
+            dist/TcpSessionTester-Python.exe
           tag_name: build-${{ github.run_number }}
           name: "TCP连接数探测工具 V${{ steps.version.outputs.APP_VERSION }} (build ${{ github.run_number }})"
+          body: |
+            **Windows C# GUI:** `TcpSessionTester.exe` — .NET Framework 4.8，未捆绑运行时。
+            **Windows Python GUI:** `TcpSessionTester-Python.exe` — PyInstaller 打包版。
+            Python 源码客户端（GUI 和 CLI）可从仓库获取。
           generate_release_notes: false
   build-server:
     runs-on: ubuntu-latest
